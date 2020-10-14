@@ -50,7 +50,7 @@ struct task_t
 
 static stack<task_t*> g_readwrite;
 static int g_listen_fd = -1;
-static int SetNonBlock(int iSock)
+static int SetNonBlock(int iSock) 
 {
     int iFlags;
 
@@ -70,14 +70,14 @@ static void *readwrite_routine( void *arg )
 	char buf[ 1024 * 16 ];
 	for(;;)
 	{
-		if( -1 == co->fd )
+		if( -1 == co->fd )  // 初始时or读写完一次, fd设为-1
 		{
-			g_readwrite.push( co );
+			g_readwrite.push( co );  // 将co添加到栈中, 切回主协程
 			co_yield_ct();
 			continue;
 		}
 
-		int fd = co->fd;
+		int fd = co->fd;  // 读写前, 先将保存fd, 将co->fd设为-1(保证fd只用于一次读写, 即：短连接)
 		co->fd = -1;
 
 		for(;;)
@@ -85,21 +85,20 @@ static void *readwrite_routine( void *arg )
 			struct pollfd pf = { 0 };
 			pf.fd = fd;
 			pf.events = (POLLIN|POLLERR|POLLHUP);
-			co_poll( co_get_epoll_ct(),&pf,1,1000);
+			co_poll( co_get_epoll_ct(),&pf,1,1000);  // 设置超时时间
 
-			int ret = read( fd,buf,sizeof(buf) );
+			int ret = read( fd,buf,sizeof(buf) );  // 读到数据, 就回射数据
 			if( ret > 0 )
 			{
 				ret = write( fd,buf,ret );
 			}
-			if( ret > 0 || ( -1 == ret && EAGAIN == errno ) )
+			if( ret > 0 || ( -1 == ret && EAGAIN == errno ) )  // 被信号中断, 重复读写
 			{
 				continue;
 			}
-			close( fd );
+			close( fd );  // 读写完成, 关闭fd, 跳出循环
 			break;
 		}
-
 	}
 	return 0;
 }
@@ -112,7 +111,7 @@ static void *accept_routine( void * )
 	for(;;)
 	{
 		//printf("pid %ld g_readwrite.size %ld\n",getpid(),g_readwrite.size());
-		if( g_readwrite.empty() )
+		if( g_readwrite.empty() )  // 栈中为空, 会调用poll等待超时(切回主协程)
 		{
 			printf("empty\n"); //sleep
 			struct pollfd pf = { 0 };
@@ -120,9 +119,10 @@ static void *accept_routine( void * )
 			poll( &pf,1,1000);
 
 			continue;
-
 		}
-		struct sockaddr_in addr; //maybe sockaddr_un;
+
+		// 栈不为空, 说明有用于读写的协程
+		struct sockaddr_in addr;
 		memset( &addr,0,sizeof(addr) );
 		socklen_t len = sizeof(addr);
 
@@ -141,7 +141,7 @@ static void *accept_routine( void * )
 			continue;
 		}
 		SetNonBlock( fd );
-		task_t *co = g_readwrite.top();
+		task_t *co = g_readwrite.top();  // 弹出一个协程, 该协程用于读写数据(切到 readwrite_routine)
 		co->fd = fd;
 		g_readwrite.pop();
 		co_resume( co->co );
@@ -180,11 +180,11 @@ static int CreateTcpSocket(const unsigned short shPort /* = 0 */,const char *psz
 			if(bReuse)
 			{
 				int nReuseAddr = 1;
-				setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&nReuseAddr,sizeof(nReuseAddr));
+				setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&nReuseAddr,sizeof(nReuseAddr)); // 地址复用
 			}
 			struct sockaddr_in addr ;
 			SetAddr(pszIP,shPort,addr);
-			int ret = bind(fd,(struct sockaddr*)&addr,sizeof(addr));
+			int ret = bind(fd,(struct sockaddr*)&addr,sizeof(addr)); // 绑定地址
 			if( ret != 0)
 			{
 				close(fd);
@@ -198,57 +198,40 @@ static int CreateTcpSocket(const unsigned short shPort /* = 0 */,const char *psz
 
 int main(int argc,char *argv[])
 {
-	if(argc<5){
+	if(argc<4){
 		printf("Usage:\n"
-               "example_echosvr [IP] [PORT] [TASK_COUNT] [PROCESS_COUNT]\n"
-               "example_echosvr [IP] [PORT] [TASK_COUNT] [PROCESS_COUNT] -d   # daemonize mode\n");
+               "example_echosvr [IP] [PORT] [TASK_COUNT] \n"
+               "example_echosvr [IP] [PORT] [TASK_COUNT] -d   # daemonize mode\n");
 		return -1;
 	}
 	const char *ip = argv[1];
 	int port = atoi( argv[2] );
 	int cnt = atoi( argv[3] );
-	int proccnt = atoi( argv[4] );
-	bool deamonize = argc >= 6 && strcmp(argv[5], "-d") == 0;
+	bool deamonize = argc >= 5 && strcmp(argv[4], "-d") == 0;
 
+	// 
 	g_listen_fd = CreateTcpSocket( port,ip,true );
+	SetNonBlock( g_listen_fd );
 	listen( g_listen_fd,1024 );
-	if(g_listen_fd==-1){
-		printf("Port %d is in use\n", port);
-		return -1;
-	}
 	printf("listen %d %s:%d\n",g_listen_fd,ip,port);
 
-	SetNonBlock( g_listen_fd );
-
-	for(int k=0;k<proccnt;k++)
+	
+	for(int i=0;i<cnt;i++)
 	{
+		task_t * task = (task_t*)calloc( 1,sizeof(task_t) ); // 创建任务task, fd初始为-1
+		task->fd = -1;
 
-		pid_t pid = fork();
-		if( pid > 0 )
-		{
-			continue;
-		}
-		else if( pid < 0 )
-		{
-			break;
-		}
-		for(int i=0;i<cnt;i++)
-		{
-			task_t * task = (task_t*)calloc( 1,sizeof(task_t) );
-			task->fd = -1;
-
-			co_create( &(task->co),NULL,readwrite_routine,task );
-			co_resume( task->co );
-
-		}
-		stCoRoutine_t *accept_co = NULL;
-		co_create( &accept_co,NULL,accept_routine,0 );
-		co_resume( accept_co );
-
-		co_eventloop( co_get_epoll_ct(),0,0 );
-
-		exit(0);
+		co_create( &(task->co),NULL,readwrite_routine,task );  // 为该task创建协程, 切换到task的协程函数
+		co_resume( task->co );
 	}
+	
+	stCoRoutine_t *accept_co = NULL;
+	co_create( &accept_co,NULL,accept_routine,0 );
+	co_resume( accept_co );
+
+	co_eventloop( co_get_epoll_ct(),0,0 );
+
+
 	if(!deamonize) wait(NULL);
 	return 0;
 }

@@ -112,22 +112,23 @@ static void *readwrite_routine( void *arg )
 	{
 		if ( fd < 0 )
 		{
-			fd = socket(PF_INET, SOCK_STREAM, 0);
+			fd = socket(PF_INET, SOCK_STREAM, 0); // 创建套接字
 			struct sockaddr_in addr;
 			SetAddr(endpoint->ip, endpoint->port, addr);
-			ret = connect(fd,(struct sockaddr*)&addr,sizeof(addr));
+			
+			ret = connect(fd,(struct sockaddr*)&addr,sizeof(addr));  // 非阻塞套接字, 要处理错误码
 						
 			if ( errno == EALREADY || errno == EINPROGRESS )
 			{       
 				struct pollfd pf = { 0 };
 				pf.fd = fd;
 				pf.events = (POLLOUT|POLLERR|POLLHUP);
-				co_poll( co_get_epoll_ct(),&pf,1,200);
+				co_poll( co_get_epoll_ct(),&pf,1,200);  // 还要使用poll再次判断连接情况
 				//check connect
 				int error = 0;
 				uint32_t socklen = sizeof(error);
 				errno = 0;
-				ret = getsockopt(fd, SOL_SOCKET, SO_ERROR,(void *)&error,  &socklen);
+				ret = getsockopt(fd, SOL_SOCKET, SO_ERROR,(void *)&error,  &socklen); // 用SO_ERROR获取错误信息
 				if ( ret == -1 ) 
 				{       
 					//printf("getsockopt ERROR ret %d %d:%s\n", ret, errno, strerror(errno));
@@ -148,11 +149,13 @@ static void *readwrite_routine( void *arg )
 			} 
 	  			
 		}
+
+		// 连接成功后
 		
-		ret = write( fd,str, 8);
+		ret = write( fd,str, 8);  // 先写入数据
 		if ( ret > 0 )
 		{
-			ret = read( fd,buf, sizeof(buf) );
+			ret = read( fd,buf, sizeof(buf) ); // 再读出数据
 			if ( ret <= 0 )
 			{
 				//printf("co %p read ret %d errno %d (%s)\n",
@@ -175,6 +178,8 @@ static void *readwrite_routine( void *arg )
 			fd = -1;
 			AddFailCnt();
 		}
+
+		// 读写完一轮后, 如果没出错, 将再次读写, 一直循环下去
 	}
 	return 0;
 }
@@ -185,34 +190,20 @@ int main(int argc,char *argv[])
 	endpoint.ip = argv[1];
 	endpoint.port = atoi(argv[2]);
 	int cnt = atoi( argv[3] );
-	int proccnt = atoi( argv[4] );
 	
 	struct sigaction sa;
 	sa.sa_handler = SIG_IGN;
-	sigaction( SIGPIPE, &sa, NULL );
-	
-	for(int k=0;k<proccnt;k++)
+	sigaction( SIGPIPE, &sa, NULL );  // SIGPIPE信号忽略, 防止向已关闭or未连接的套接字写数据, 导致程序异常终止
+
+	// 创建cnt个协程任务, 用于读写	
+	for(int i=0;i<cnt;i++)
 	{
-
-		pid_t pid = fork();
-		if( pid > 0 )
-		{
-			continue;
-		}
-		else if( pid < 0 )
-		{
-			break;
-		}
-		for(int i=0;i<cnt;i++)
-		{
-			stCoRoutine_t *co = 0;
-			co_create( &co,NULL,readwrite_routine, &endpoint);
-			co_resume( co );
-		}
-		co_eventloop( co_get_epoll_ct(),0,0 );
-
-		exit(0);
+		stCoRoutine_t *co = 0;
+		co_create( &co,NULL,readwrite_routine, &endpoint);
+		co_resume( co );
 	}
+	co_eventloop( co_get_epoll_ct(),0,0 );
+
 	return 0;
 }
-/*./example_echosvr 127.0.0.1 10000 100 50*/
+/*./example_echosvr 127.0.0.1 10000 50*/
