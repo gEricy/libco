@@ -320,6 +320,7 @@ int close(int fd)
 
 	return ret;
 }
+
 ssize_t read( int fd, void *buf, size_t nbyte )
 {
 	HOOK_SYS_FUNC( read );
@@ -342,8 +343,10 @@ ssize_t read( int fd, void *buf, size_t nbyte )
 	pf.fd = fd;
 	pf.events = ( POLLIN | POLLERR | POLLHUP );
 
+    // 核心
 	int pollret = poll( &pf,1,timeout );
 
+    // read: 事件到来后，调用系统函数阻塞式地read读取数据
 	ssize_t readret = g_sys_read_func( fd,(char*)buf ,nbyte );
 
 	if( readret < 0 )
@@ -570,7 +573,13 @@ extern int co_poll_inner( stCoEpoll_t *ctx,struct pollfd fds[], nfds_t nfds, int
  *   poll函数在hook目录下
  *      注意: 在调用read\write\recv\send\connect等函数时, timeout_ms永远不为0
  *
- * @brief  该函数用来添加一个read\write事件
+ * @detail
+ *         poll函数的核心:
+ *              将(IO事件/超时事件)托管给epoll管理
+ *              切回epoll主协程
+ *              当事件触发后，将切回事件协程处理之
+ *
+ * @brief  该函数用来添加一个read\write等事件
  *            添加完事件后, 将会切走协程
  *            当事件触发后, 将会切回来
  */
@@ -617,9 +626,8 @@ int poll(struct pollfd fds[], nfds_t nfds, int timeout_ms)
 		}
 	}
 	free(fds_merge);
+
 	return ret;
-
-
 }
 int setsockopt(int fd, int level, int option_name,
 			                 const void *option_value, socklen_t option_len)

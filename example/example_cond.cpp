@@ -42,8 +42,9 @@ void* Producer(void* args)
 		task->id = id++;
 		env->task_queue.push(task);
 		printf("%s:%d produce task %d\n", __func__, __LINE__, task->id);
-		co_cond_signal(env->cond); // (4) 唤醒在条件变量等待的协程, 将会切换到(2)
-		poll(NULL, 0, 1000);  // (5) 调用poll, 将生产者协程设置超时时间, 然后切走
+		co_cond_signal(env->cond); // 将cond的超时事件，移到就绪队列中
+		poll(NULL, 0, 1000);       // 调用poll, 从Producer协程切回到主协程co_event_loop, 等待1000s后，epoll_wait将会返回，此时，会处理就绪队列中的任务
+		                           //     处理方式，之前已经讲过，是切换到cond的协程中，继续执行
 	}
 	return NULL;
 }
@@ -55,10 +56,11 @@ void* Consumer(void* args)
 	{
 		if (env->task_queue.empty()) // 队列为空
 		{
-			co_cond_timedwait(env->cond, -1);  // (2) 在条件变量等待, 切回主协程
+		    // 在条件变量等待，内部调用了co_yield_ct，即：使消费者协程阻塞，切回到主协程
+			co_cond_timedwait(env->cond, -1);   // -1表示永久超时
 			continue;
 		}
-		stTask_t* task = env->task_queue.front();  // (6) 从队列中取出任务, 执行任务, 执行完后会再次进入步骤(2)等待
+		stTask_t* task = env->task_queue.front();
 		env->task_queue.pop();
 		printf("%s:%d consume task %d\n", __func__, __LINE__, task->id);
 		free(task);
@@ -78,12 +80,14 @@ int main()
 	stCoRoutine_t* consumer_routine;
 	stCoRoutine_t* producer_routine;
 
-	// (1) 创建消费者协程，切换到该协程Consumer执行
+	// 创建消费者协程
 	co_create(&consumer_routine, NULL, Consumer, env); 
+    // 阻塞当前主协程，切换到消费者协程（执行协程函数Consumer）
 	co_resume(consumer_routine);
 
-	// (3) 创建生产者协程, 切换到该协程Producer执行
+	// 创建生产者协程
 	co_create(&producer_routine, NULL, Producer, env);
+    // 阻塞当前主协程，切换到生产者协程（执行协程函数Producer）
 	co_resume(producer_routine);
 	
 	co_eventloop(co_get_epoll_ct(), NULL, NULL);

@@ -85,9 +85,11 @@ static void *readwrite_routine( void *arg )
 			struct pollfd pf = { 0 };
 			pf.fd = fd;
 			pf.events = (POLLIN|POLLERR|POLLHUP);
-			co_poll( co_get_epoll_ct(),&pf,1,1000);  // 设置超时时间
+			co_poll( co_get_epoll_ct(),&pf,1,1000);  // 将超时事件添加到epoll中监管，切回主协程co_event_loop
+			                                // 超时事件触发后，会再次切回到此co
 
-			int ret = read( fd,buf,sizeof(buf) );  // 读到数据, 就回射数据
+			int ret = read( fd,buf,sizeof(buf) ); // 将读事件添加到epoll中监管，切回主协程co_event_loop
+			                                // 读事件触发后，会再次切回到此co
 			if( ret > 0 )
 			{
 				ret = write( fd,buf,ret );

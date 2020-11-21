@@ -48,10 +48,15 @@ using namespace std;
 stCoRoutine_t *GetCurrCo( stCoRoutineEnv_t *env ); 
 struct stCoEpoll_t; 
 
+
+// 协程环境
+// 所有协程都共用这一个协程环境，它是所有协程的全局唯一的变量
 struct stCoRoutineEnv_t
 {
+    // 非对称协程，举例：在协程A中开启了协程B，协程B中开启了协程C，那么pCallStack=[A,B,C]
+    // 栈顶元素始终是当前正在执行的协程
 	stCoRoutine_t *pCallStack[ 128 ];   // 协程调用栈(栈顶元素始终是当前正在运行的协程)
-	int iCallStackSize;    // 协程栈中协程的个数
+	int iCallStackSize;    // 协程栈中协程的个数, iCallStackSize-1指向栈顶
 
 	stCoEpoll_t *pEpoll;   // Epoll管理者
 
@@ -292,8 +297,8 @@ struct stCoEpoll_t
 
 	struct stTimeout_t *pTimeout;   // 时间轮 (数组: 元素是双向链表)
 
-	struct stTimeoutItemLink_t *pstTimeoutList;   // 链表头：超时事件
-	struct stTimeoutItemLink_t *pstActiveList;    // 链表头：激活事件 (每次事件到来, 都将清空该链表上, 触发注册的事件)
+	struct stTimeoutItemLink_t *pstTimeoutList;   // 链表头: 超时事件
+	struct stTimeoutItemLink_t *pstActiveList;    // 链表头: 激活事件 (每次事件到来, 都将清空该链表上, 触发注册的事件)
 
 	co_epoll_res *result;   // epoll_wait激活事件数组
 }; 
@@ -315,12 +320,12 @@ struct stTimeoutItem_t
 	// 双向链表的首尾指针
 	stTimeoutItemLink_t *pLink; 
 
-	unsigned long long ullExpireTime; 
+	unsigned long long ullExpireTime;  // 超时时间
 
-	OnPreparePfn_t pfnPrepare;   // 预处理
-	OnProcessPfn_t pfnProcess;   // 事件触发执行的函数
+	OnPreparePfn_t   pfnPrepare;   // 预处理
 
-	void *pArg;  // routine 保存了该超时结构体的协程co, 用于超时时, 切换到co执行
+	OnProcessPfn_t   pfnProcess;   // 事件触发执行的函数
+	void            *pArg;         // routine 保存了该超时结构体的协程co, 用于超时时, 切换到co执行
 
 	bool bTimeout;  // 是否超时的标记
 }; 
@@ -441,7 +446,7 @@ static int CoRoutineFunc( stCoRoutine_t *co, void * )
 	stCoRoutineEnv_t *env = co->env; 
 
 
-	// 该协程执行完成后, 要在协程调用栈中删除该协程, 切回上次的协程(curr --> last)
+	// 上面协程函数执行完后，切回到之前的协程
 	co_yield_env( env );   
 
 	return 0; 
@@ -509,13 +514,17 @@ struct stCoRoutine_t *co_create_env( stCoRoutineEnv_t * env,  const stCoRoutineA
 	return lp; 
 }
 
-// 创建协程, 注册协程函数\参数
+/* 创建协程, 注册协程函数\参数
+ *  @param [out]  ppco  传出参数，保存新创建的协程co
+ */ 
 int co_create( stCoRoutine_t **ppco, const stCoRoutineAttr_t *attr, pfn_co_routine_t pfn, void *arg )
 {
+    // 若没有全局唯一的协程环境，就先创建它
 	if( !co_get_curr_thread_env() ) 
 	{
 		co_init_curr_thread_env(); 
 	}
+    // 创建协程co （此处仅仅是创建协程co，并没有将其添加到pCallStack，更没有切换到co）
 	stCoRoutine_t *co = co_create_env( co_get_curr_thread_env(),  attr,  pfn, arg ); 
 	*ppco = co; 
 	return 0; 
@@ -547,18 +556,30 @@ void co_release( stCoRoutine_t *co )
 
 void co_swap(stCoRoutine_t* curr,  stCoRoutine_t* pending_co); 
 
+/* 
+ * @brief 切换到协程co执行
+ */ 
 void co_resume( stCoRoutine_t *co )
 {
 	stCoRoutineEnv_t *env = co->env; 
-	stCoRoutine_t *lpCurrRoutine = env->pCallStack[ env->iCallStackSize - 1 ];  // 正在运行的协程 (栈顶)
+
+    // 取出pCallStack栈顶元素(当前正在运行的协程)
+	stCoRoutine_t *lpCurrRoutine = env->pCallStack[ env->iCallStackSize - 1 ];
+
+    // 若co第一次执行，要先为co绑定上下文(协程堆栈、协程函数)
 	if( !co->cStart )
 	{
 		coctx_make( &co->ctx, (coctx_pfn_t)CoRoutineFunc, co, 0 ); 
 		co->cStart = 1; 
 	}
-	
-	env->pCallStack[ env->iCallStackSize++ ] = co; 
-	co_swap( lpCurrRoutine,  co );   // lpCurrRoutine切换到协程co绑定的上下文函数(CoRoutineFunc)
+
+    // 将当前协程co，添加到pCallStack
+	env->pCallStack[ env->iCallStackSize++ ] = co;
+
+    // 协程切换, lpCurrRoutine --> co (上一个正在运行的协程 --> 当前协程co)
+    // 此后，会切换到co的协程函数执行，即调用CoRoutineFunc
+    //     说明: (在CoRoutineFunc函数中，先执行协程回调函数，执行完成后，会调用co_yield_env再切换到此处)
+	co_swap( lpCurrRoutine,  co );   
 }
 
 
@@ -595,7 +616,9 @@ void co_yield_env( stCoRoutineEnv_t *env )
 
 	env->iCallStackSize--;   // 删除当前正在执行的协程任务
 
-	co_swap( curr,  last);   // 当前正在执行的协程curr, 切换到上次执行的协程last
+    // 当前正在执行的协程curr, 切换到上次执行的协程last
+    //    curr挂起，切换到last执行
+	co_swap( curr,  last);   
 }
 
 void co_yield_ct()
@@ -624,7 +647,10 @@ void save_stack_buffer(stCoRoutine_t* occupy_co)
 	memcpy(occupy_co->save_buffer,  occupy_co->stack_sp,  len); 
 }
 
-// 从curr切换到pending_to, 如果想切回来, 还要手动调用co_swap
+/* @brirf 协程切换  curr --> pending_co
+ *    将curr协程挂起
+ *    切换到pending_co协程，让pending_co协程运行
+ */
 static void co_swap(stCoRoutine_t* curr,  stCoRoutine_t* pending_co)
 {
  	stCoRoutineEnv_t* env = co_get_curr_thread_env(); 
@@ -725,7 +751,7 @@ static short EpollEvent2Poll( uint32_t events )
 // 协程环境env
 static __thread stCoRoutineEnv_t* gCoEnvPerThread = NULL; 
 
-// 初始化协程环境
+// 初始化全局唯一的协程环境
 void co_init_curr_thread_env()
 {
 	gCoEnvPerThread = (stCoRoutineEnv_t*)calloc( 1,  sizeof(stCoRoutineEnv_t) ); 
@@ -733,15 +759,16 @@ void co_init_curr_thread_env()
 
 	env->iCallStackSize = 0; 
 
-	struct stCoRoutine_t *self = co_create_env( env,  NULL,  NULL, NULL );   // 创建主协程的协程结构图
+    // 创建主协程self
+	struct stCoRoutine_t *self = co_create_env( env,  NULL,  NULL, NULL );
 	self->cIsMain = 1; 
 	coctx_init( &self->ctx ); 
 
 	env->pending_co = NULL; 
 	env->occupy_co = NULL; 
-	env->pCallStack[ env->iCallStackSize++ ] = self; 
+	env->pCallStack[ env->iCallStackSize++ ] = self;  // 将主协程添加到pCallStack中
 
-	// env->pEpoll
+	// 创建 env->pEpoll
 	stCoEpoll_t *ev = AllocEpoll(); 
 	SetEpoll( env, ev ); 
 }
@@ -846,7 +873,7 @@ void co_eventloop( stCoEpoll_t *ctx, pfn_co_eventloop_t pfn, void *arg )
 				}
 			}
 			if( lp->pfnProcess )  // 触发该事件注册的激活函数(OnPollProcessEvent): 即切换到该事件的协程中去
-			{				      //      当注册的协程激活函数执行完成后, 还会立即切回来！
+			{
 				lp->pfnProcess( lp ); 
 			}
 
@@ -869,7 +896,7 @@ stCoEpoll_t *AllocEpoll()
 	stCoEpoll_t *ctx = (stCoEpoll_t*)calloc( 1, sizeof(stCoEpoll_t) ); 
 
 	ctx->iEpollFd = co_epoll_create( stCoEpoll_t::_EPOLL_SIZE ); 
-	ctx->pTimeout = AllocTimeout( 60 * 1000 ); 
+	ctx->pTimeout = AllocTimeout( 60 * 1000 );   // 时间轮的尺寸，保存了(60*1000)个时间片
 	
 	ctx->pstActiveList = (stTimeoutItemLink_t*)calloc( 1, sizeof(stTimeoutItemLink_t) ); 
 	ctx->pstTimeoutList = (stTimeoutItemLink_t*)calloc( 1, sizeof(stTimeoutItemLink_t) ); 
@@ -905,8 +932,7 @@ stCoRoutine_t *GetCurrThreadCo( )
 
 
 /*
- * @brief  该函数用来添加一个read\write事件
- *            添加完事件后, 将会切走协程
+ * @brief  注册(IO事件/超时事件)到epoll中，切走协程，由epoll监管事件的发生
  */
 typedef int (*poll_pfn_t)(struct pollfd fds[],  nfds_t nfds,  int timeout); 
 int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int timeout,  poll_pfn_t pollfunc)
@@ -920,32 +946,33 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 		timeout = INT_MAX; 
 	}
 	
-	int epfd = ctx->iEpollFd; 
-	stCoRoutine_t* self = co_self(); 
+	int epfd = ctx->iEpollFd; // epoll句柄
+	stCoRoutine_t* self = co_self();
 
 	//1. struct change  结构体转化
 	stPoll_t& arg = *((stPoll_t*)malloc(sizeof(stPoll_t))); 
 	memset( &arg, 0, sizeof(arg) ); 
 
 	arg.iEpollFd = epfd; 
-	arg.fds = (pollfd*)calloc(nfds,  sizeof(pollfd));  // poll: 该事件可能绑定多个文件描述符fds
+	arg.fds = (pollfd*)calloc(nfds,  sizeof(pollfd));
 	arg.nfds = nfds; 
 
 	stPollItem_t arr[2]; 
-	if( nfds < sizeof(arr) / sizeof(arr[0]) && !self->cIsShareStack)  // 只有一个fd && 不是共享栈
+	if( nfds < sizeof(arr) / sizeof(arr[0]) && !self->cIsShareStack )
 	{
 		arg.pPollItems = arr; 
 	}	
-	else  // 多个fd
+	else
 	{
-		arg.pPollItems = (stPollItem_t*)malloc( nfds * sizeof( stPollItem_t ) );  // 创建多个epoll_event
+		arg.pPollItems = (stPollItem_t*)malloc( nfds * sizeof( stPollItem_t ) );
 	}
 	memset( arg.pPollItems, 0, nfds * sizeof(stPollItem_t) ); 
 
-	arg.pfnProcess = OnPollProcessEvent;  // 事件触发后, 执行的回调函数
-	arg.pArg = GetCurrCo( co_get_curr_thread_env() );  // 回调函数的参数是当前的协程co, 方便执行完事件后, 切回当前的协程
+    // 2. 注册事件触发的回调函数+回调函数参数
+	arg.pfnProcess = OnPollProcessEvent;  // epoll监测到事件触发后, 将执行该回调函数
+	arg.pArg = GetCurrCo( co_get_curr_thread_env() );  // 回调函数的参数是当前的协程co: 当事件触发后，会重新切到该co
 	
-	//2. add epoll  添加epoll事件
+	//3. add epoll  将事件添加到epoll中监控
 	for(nfds_t i=0; i<nfds; i++)
 	{
 		arg.pPollItems[i].pSelf = arg.fds + i; 
@@ -963,24 +990,21 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 		}
 	}
 
-	//3. add timeout  因为timeout一定不为0, 因此还要注册超时事件
-
+	//4. add timeout  因为timeout一定不为0, 因此还要注册超时事件
 	unsigned long long now = GetTickMS(); 
 	arg.ullExpireTime = now + timeout; 
 	int ret = AddTimeout( ctx->pTimeout, &arg, now ); 
 	int iRaiseCnt = 0; 
 
-
-	// 4. 添加完上面的2个事件(读写事件\超时事件)后, 此时切走协程? 为什么?
+	// 5. 添加完上面的2个事件(读写事件\超时事件)后, 此时切走协程? 为什么?
 	//    答：
 	//      (1) 因为已经将事件注册到epoll上了, 把事件托管给epoll管理
-	//      (2) 当epoll事件触发后, 将执行 OnPollProcessEvent 函数, 切换到该事件绑定的协程函数co->pfn
-	//          执行完协程函数co->pfn后, 将会切回
+	//      (2) 当epoll事件触发后, 将执行 OnPollProcessEvent 函数, 切换到该事件绑定的协程函数 co->pfn
+	//          执行完协程函数co->pfn后, 将会切回到该co (在poll外面，将调用read/write等函数阻塞地完成该事件)
 	co_yield_env( co_get_curr_thread_env() );   
 	iRaiseCnt = arg.iRaiseCnt; 
 
-
-	// 5. 事件执行完毕后, 将从epoll中摘除(超时事件, 读写事件)
+	// 6. 事件执行完毕后, 将从epoll中摘除(超时事件, 读写事件)
     {
 		//clear epoll status and memory
 		RemoveFromLink<stTimeoutItem_t, stTimeoutItemLink_t>( &arg ); // 从epoll中摘除该超时事件
@@ -993,7 +1017,6 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 			}
 			fds[i].revents = arg.fds[i].revents; 
 		}
-
 
 		if( arg.pPollItems != arr )
 		{
@@ -1121,7 +1144,7 @@ stCoCondItem_t *co_cond_pop( stCoCond_t *link )
 	return p; 
 }
 
-// 唤醒第一个等待在条件变量上的事件
+// 仅仅是将等待在条件变量si上的事件，移动到激活链表中
 int co_cond_signal( stCoCond_t *si )
 {
 	stCoCondItem_t * sp = co_cond_pop( si ); 
@@ -1129,7 +1152,7 @@ int co_cond_signal( stCoCond_t *si )
 	{
 		return 0; 
 	}
-	RemoveFromLink<stTimeoutItem_t, stTimeoutItemLink_t>( &sp->timeout );  // 从超时队列中摘除
+	RemoveFromLink<stTimeoutItem_t, stTimeoutItemLink_t>( &sp->timeout );       // 从超时队列中摘除
 	AddTail( co_get_curr_thread_env()->pEpoll->pstActiveList, &sp->timeout );   // 添加到激活链表
 
 	return 0; 
@@ -1157,7 +1180,7 @@ int co_cond_broadcast( stCoCond_t *si )
 int co_cond_timedwait( stCoCond_t *link, int ms )
 {
 	stCoCondItem_t* psi = (stCoCondItem_t*)calloc(1,  sizeof(stCoCondItem_t)); 
-	psi->timeout.pArg = GetCurrThreadCo(); 
+	psi->timeout.pArg = GetCurrThreadCo();  // 获取当前正在运行的协程co
 	psi->timeout.pfnProcess = OnSignalProcessEvent; 
 
 	if( ms > 0 )
@@ -1175,7 +1198,7 @@ int co_cond_timedwait( stCoCond_t *link, int ms )
 	}
 	AddTail( link,  psi);   // 事件添加到等待条件变量链表中
 
-	co_yield_ct(); // 切走协程, 当条件变量事件触发时, 切回
+	co_yield_ct(); // 核心: 切走当前协程co, 当条件变量事件触发时, 切回
 
 	RemoveFromLink<stCoCondItem_t, stCoCond_t>( psi );  // 切回后, 将该事件从条件变量链表中删除
 	free(psi); 
