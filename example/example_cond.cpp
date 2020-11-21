@@ -57,7 +57,8 @@ void* Consumer(void* args)
 		if (env->task_queue.empty()) // 队列为空
 		{
 		    // 在条件变量等待，内部调用了co_yield_ct，即：使消费者协程阻塞，切回到主协程
-			co_cond_timedwait(env->cond, -1);   // -1表示永久超时
+		    // 当等待在该条件变量的事件触发后（被co_cond_signal唤醒），将会重新切回到此处，继续执行
+			co_cond_timedwait(env->cond, -1);   // 将当前协程, 在条件变量上, 永久等待
 			continue;
 		}
 		stTask_t* task = env->task_queue.front();

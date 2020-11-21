@@ -321,6 +321,14 @@ int close(int fd)
 	return ret;
 }
 
+
+/*
+ * read函数，使用了HOOK机制，对其进行重写
+ *   @detail  read函数的使用，必须在协程回调函数中（即，它必须处于协程上下文内部）
+ * 1. poll
+ *        
+ * 2. 同步read: 数据到来，读取数据
+ */
 ssize_t read( int fd, void *buf, size_t nbyte )
 {
 	HOOK_SYS_FUNC( read );
@@ -343,7 +351,7 @@ ssize_t read( int fd, void *buf, size_t nbyte )
 	pf.fd = fd;
 	pf.events = ( POLLIN | POLLERR | POLLHUP );
 
-    // 核心
+    // 核心: 
 	int pollret = poll( &pf,1,timeout );
 
     // read: 事件到来后，调用系统函数阻塞式地read读取数据
@@ -576,12 +584,19 @@ extern int co_poll_inner( stCoEpoll_t *ctx,struct pollfd fds[], nfds_t nfds, int
  * @detail
  *         poll函数的核心:
  *              将(IO事件/超时事件)托管给epoll管理
- *              切回epoll主协程
- *              当事件触发后，将切回事件协程处理之
+ *              切走: 切到epoll主协程, 由epoll监控事件的就绪
+ *              切回: 当事件就绪后，执行回调函数, 再重新切回来，继续处理该协程事件
  *
  * @brief  该函数用来添加一个read\write等事件
  *            添加完事件后, 将会切走协程
  *            当事件触发后, 将会切回来
+ * @note
+ *    如果你真的不懂, 也不耽误你的使用, poll的使用场景无非就分为2类:
+ *        case1: 直接调用poll, 用于超时事件, 如: poll(NULL, 0, 1000);
+ *        case2: read/write函数中调用了poll
+ *    牢牢记住, 
+ *       poll函数的使用一定要在co_create创建的协程函数中, 它内部由libco给我们提供了协程的切换
+ *       你可以把它当作是同步调用来使用(本质上, libco将它采用hook机制, 封装成 “协程+epoll异步调用”的方式了 )
  */
 int poll(struct pollfd fds[], nfds_t nfds, int timeout_ms)
 {
