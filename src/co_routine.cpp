@@ -749,6 +749,7 @@ static short EpollEvent2Poll( uint32_t events )
 }
 
 // 协程环境env
+//     __thread: 线程局部存储
 static __thread stCoRoutineEnv_t* gCoEnvPerThread = NULL; 
 
 // 初始化全局唯一的协程环境
@@ -977,7 +978,7 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 	arg.pfnProcess = OnPollProcessEvent;                // epoll监测到事件触发后, 将执行该回调函数
 	arg.pArg = GetCurrCo( co_get_curr_thread_env() );   // 回调函数的参数是当前的协程co: 当事件触发后，会重新切到该co
 	
-	// 3.1. co_epoll_ctl: (add epoll) 将事件添加到epoll中监控
+	// 3.1. [EPOLL_CTL_ADD]: co_epoll_ctl: (add epoll) 将事件添加到epoll中监控
 	for(nfds_t i=0; i<nfds; i++)
 	{
 		arg.pPollItems[i].pSelf = arg.fds + i; 
@@ -1000,7 +1001,8 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 	int ret = AddTimeout( ctx->pTimeout, &arg, now ); 
 	int iRaiseCnt = 0; 
 
-	// 4. 添加完上面的2个事件(读写事件\超时事件)后, 此时切走协程? 为什么?
+	// 4. [yeild]
+	//    添加完上面的2个事件(读写事件\超时事件)后, 此时切走协程? 为什么?
 	//    答：
 	//      (1) 因为已经将事件注册到epoll上了, 把事件托管给epoll管理
 	//      (2) 当epoll事件触发后, 将执行 OnPollProcessEvent 函数, 该函数的功能是: 切回到此处，继续向下执行
@@ -1008,7 +1010,8 @@ int co_poll_inner( stCoEpoll_t *ctx, struct pollfd fds[],  nfds_t nfds,  int tim
 	                                           // （2）当事件触发后，调用回调函数OnPollProcessEvent，又会重新切回到此处
 	iRaiseCnt = arg.iRaiseCnt; 
 
-    // 5.下面讲解事件就绪后，重新切回来之后的处理逻辑
+    // 5. [EPOLL_CTL_DEL] 将该事件从epoll调度器中摘除掉
+    //   下面讲解事件就绪后，重新切回来之后的处理逻辑
 	//    6.1. 首先, 将该(超时事件, 读写事件)从epoll中摘除, 直到poll函数执行完毕
 	//    6.2. 然后, 会继续执行read函数中poll函数之后的逻辑 (可以跳转到 read 函数去阅读代码)
     {
@@ -1125,9 +1128,26 @@ struct stCoCondItem_t {
 	stTimeoutItem_t timeout; 
 }; 
 
-/* 条件变量结构体
- * @detail  条件变量的实体, 是一个双向链表
- *          若某个事件需要在该条件变量上等待, 那么, 就将该事件添加到该条件变量的双向链表中
+/* 条件变量实体
+ * @detail  条件变量的实体, 是一个双向链表, 其中存着stCoCondItem_t结构，
+ *      [ms < 0] 
+ *        (1)永久等待 cond_wait
+ *               某个协程需要在该cond上等待时（假设ms=-1，表示无限等待）
+ *               1. 就会[创建]一个stCoCondItem_t结构，将其插入到cond链表的实体（双向链表）中
+ *               2. 然后调用yeild，切回到调度器协程环境
+ *       ----------------------------------------------------------------------------------------
+ *               3. （cond_signal后，插入到就绪链表）调度时，会resume回来，执行注册的协程函数
+ *               4. 协程函数执行完毕后，将stCoCondItem_t从cond链表删除，并free该结构
+ *                  （此时，等待在cond上的协程co执行完毕！）
+ *        (2)唤醒     cond_signal (实现非常简单，就是把 stCoCondItem_t结构 放入 就绪链表)
+ *               将cond双向链表中所有的stCoCondItem_t结构，全部移动到就绪队列中，执行调度
+ *
+ *
+ *       [ms > 0]
+ *          区别
+ *               1. 除了将stCoCondItem_t结构加入到条件变量cond链表中，还要加入[时间轮]
+ *               2. 这样，将stCoCondItem_t结构从cond链表中摘除的触发，除了调用cond_signal之外，
+ *                       还有一种方式，就是超时!
  */
 struct stCoCond_t
 {
@@ -1172,7 +1192,11 @@ int co_cond_signal( stCoCond_t *si )
 	return 0; 
 }
 
-// 唤醒所有等待在条件变量上的事件
+
+/* 唤醒所有等待在条件变量上的事件
+ *   @detail
+ *      将cond链表中的所有stCoCondItem_t结构，都移动到就绪队列中
+ */
 int co_cond_broadcast( stCoCond_t *si )
 {
 	for(; ; )
@@ -1180,33 +1204,42 @@ int co_cond_broadcast( stCoCond_t *si )
 		stCoCondItem_t * sp = co_cond_pop( si ); 
 		if( !sp ) return 0; 
 
-		RemoveFromLink<stTimeoutItem_t, stTimeoutItemLink_t>( &sp->timeout ); // 从超时队列中摘除
+		RemoveFromLink<stTimeoutItem_t, stTimeoutItemLink_t>( &sp->timeout );      // 从超时队列中摘除
 		AddTail( co_get_curr_thread_env()->pEpoll->pstActiveList, &sp->timeout );  // 添加到激活链表
 	}
 
 	return 0; 
 }
 
-/* 将当前协程, 在条件变量link上, 等待 (超时事件设为ms毫秒)
+/* @brief 将当前协程, 在条件变量link上, 等待 (超时事件设为ms毫秒)
  *
  *  @param  [in]  link  条件变量, 外部定义env->cond   
  *  @param  [in]  ms    等待超时时间
  *                ms <= 0 永久等待
  *                ms >  0 等待毫秒数 
+ *
+ *  
+ *        我们可以看到实现非常简单，条件变量的实体就是一条链表，其中存着stCoCondItem_t结构，
+ *        在wait时创建一个stCoCondItem_t结构把其插入到代表条件变量实体的链表中，
+ *        然后就切换CPU执行权，当然这个如果注册了超时时间也会被放入到时间轮中。
  */
 int co_cond_timedwait( stCoCond_t *link, int ms )
 {
+    // 1. 申请一个超时事件结构体psi
 	stCoCondItem_t* psi = (stCoCondItem_t*)calloc(1,  sizeof(stCoCondItem_t)); 
-    
-	psi->timeout.pArg = GetCurrThreadCo();  // 获取当前正在运行的协程co
-	psi->timeout.pfnProcess = OnSignalProcessEvent; 
 
-	if( ms > 0 )
+    // 2. psi成员赋值
+    
+    //    2.1. 超时事件触发: 回调函数 + 参数
+	psi->timeout.pfnProcess = OnSignalProcessEvent; // 超时事件触发时的回调函数
+	psi->timeout.pArg = GetCurrThreadCo();  // 超时事件触发时的参数：获取当前正在运行的协程co(即，调用co_cond_timedwait的协程的co)
+
+	if( ms > 0 )  // 超时事件注册: 如果条件超时参数 ms 设置了，就加入到env中的超时链表
 	{
 		unsigned long long now = GetTickMS(); 
 		psi->timeout.ullExpireTime = now + ms; 
 
-		// 事件添加到等待链表
+		//    2.2. 将超时事件添加到时间轮
 		int ret = AddTimeout( co_get_curr_thread_env()->pEpoll->pTimeout, &psi->timeout, now ); 
 		if( ret != 0 )
 		{
@@ -1214,7 +1247,10 @@ int co_cond_timedwait( stCoCond_t *link, int ms )
 			return ret; 
 		}
 	}
-	AddTail( link,  psi);   // 事件添加到等待条件变量链表中
+    else {  // ms < 0
+        // 相当于timeout为负的话[超时时间无限]，此时条件变量中有一个事件在等待，也就是一个协程待唤醒
+    }
+	AddTail( link,  psi);   // 事件添加到等待条件变量链表中？？？
 
 	co_yield_ct(); // 核心: 切走当前协程co, 当条件变量事件触发时, (在epoll中触发peocess回调以后, 重新切回这里
 
